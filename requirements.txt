@@ -1,0 +1,7 @@
+polars
+requests
+ipykernel
+matplotlib
+seaborn
+pandas
+numpy
