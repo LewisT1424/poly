@@ -76,7 +76,11 @@ class Model:
             return None
         
     def get_X_y(self, df: pl.DataFrame):
-        EXCLUDE_COLS = ['market_id', 'resolved_yes', 'end_date', 'price_end']
+        EXCLUDE_COLS = [
+            'market_id', 'resolved_yes', 'end_date',
+            'price_start', 'price_end', 'price_mean',
+            'price_min', 'price_max'
+        ]
         FEATURE_COLS = [c for c in self.feature_matrix.columns if c not in EXCLUDE_COLS]
 
         X = df.select(FEATURE_COLS)

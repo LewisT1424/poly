@@ -306,45 +306,13 @@ Model registered in MLflow registry as `polymarket-xgboost v3`.
 
 ---
 
-## Stage 5 — Model Analysis and Overfitting Checks
+---
 
-Conducted in `notebooks/model-analysis.ipynb`.
+## Stage 5 Update — Model Fixes and Retraining
 
-### Check 1 — Train vs Test Performance
+### Problem Identified
 
-| | Train | Test |
-|---|---|---|
-| Brier Score | 0.0215 | 0.0567 |
-| AUC-ROC | 0.9994 | 0.9717 |
-
-**Finding:** Significant overfitting. Train AUC of 0.9994 is near-perfect memorisation of training data. Gap of 0.028 between train and test AUC indicates the model has not fully generalised.
-
-**Root cause:** `max_depth: 8` found by Optuna allows very deep trees that memorise training-specific patterns.
-
-### Check 2 — Calibration Curve
-
-Model is well calibrated at extremes (near 0 and 1). In the middle range (0.4-0.8) the model is overconfident — predicts 60-80% probability when actual resolution rates are 30-55%.
-
-**Finding:** Probability calibration with `CalibratedClassifierCV` will be required before MAPIE to correct this curve.
-
-### Check 3 — Feature Importance
-
-| Feature | Importance |
-|---|---|
-| price_end | 57% |
-| price_mean | ~3% |
-| price_min | ~3% |
-| All others | ~2% each |
-
-**Finding:** `price_end` dominates at 57%. The model is essentially reading the current market price and largely ignoring momentum, volume, and sentiment signals.
-
-### Check 4 — Prediction Distribution
-
-Strongly bimodal — vast majority of predictions near 0 or near 1, very few in the middle range.
-
-**Finding:** Model is overconfident across the board. Combined with feature importance, this confirms the model is reading near-resolved prices rather than genuinely predicting from uncertainty.
-
-### Feature Correlation with Target
+After initial model analysis, all price level features were found to be highly correlated with the target variable:
 
 | Feature | Correlation with resolved_yes |
 |---|---|
@@ -354,44 +322,106 @@ Strongly bimodal — vast majority of predictions near 0 or near 1, very few in 
 | price_max | 0.6241 |
 | price_start | 0.4833 |
 
-**Finding:** All price level features are highly correlated with the outcome. This is because the majority of markets in the dataset are measured very close to their resolution date — the price already encodes the answer. Removing `price_end` alone does not solve the problem as the model simply shifts importance to `price_mean`.
+This was because the majority of markets in the dataset are measured very close to their resolution date — the price already encodes the answer. The model was reading a nearly-resolved price rather than genuinely predicting from uncertainty.
 
----
+### Attempted Fixes
 
-## Known Issues and Planned Fixes
+**Attempt 1 — Remove price_end only**
+Updated `EXCLUDE_COLS` to include `price_end`. Model performance unchanged — Brier 0.0573, AUC 0.9723. The model simply shifted importance to `price_mean` which carries near-identical information.
 
-### Root Cause
+**Attempt 2 — Change window strategy to 60-30 days before resolution**
+Investigated using a window 60-30 days before resolution to force genuinely uncertain predictions. Only 2,621 markets had sufficient trades in this window — too thin for reliable training and MAPIE calibration. Ruled out.
 
-The training data is dominated by markets measured very close to resolution. All price level features encode near-resolved information, making the classification task artificially easy. The model learned the easy pattern instead of the interesting one.
+**Attempt 3 — Change window strategy to 45-15 days before resolution**
+Even fewer viable markets at 2,389. Ruled out.
 
-### Issue 1 — Overfitting
-- **Cause:** Deep trees memorise training-specific patterns
-- **Status:** Partially addressed by capping `max_depth` at 5 in Optuna
-
-### Issue 2 — Price feature dominance
-- **Cause:** All price features correlate 0.62-0.84 with outcome due to near-resolution measurement
-- **Status:** Removing `price_end` alone insufficient — model shifts to `price_mean`
-
-### Issue 3 — Overconfident predictions
-- **Cause:** Follows directly from issues 1 and 2
-- **Status:** Pending
-
-### Planned Fix — Change Window Strategy
-
-Instead of the last 30 days before resolution, use a fixed historical window 60-30 days before resolution:
+**Final fix — Remove all price level features**
+Removed `price_start`, `price_end`, `price_mean`, `price_min`, `price_max` from the feature set entirely. Kept only dynamic and metadata features:
 ```python
-LOOKBACK_END_DAYS = 30    # window ends 30 days before resolution
-LOOKBACK_START_DAYS = 60  # window starts 60 days before resolution
-
-window_end   = end_date - timedelta(days=LOOKBACK_END_DAYS)
-window_start = end_date - timedelta(days=LOOKBACK_START_DAYS)
+EXCLUDE_COLS = [
+    'market_id', 'resolved_yes', 'end_date',
+    'price_start', 'price_end', 'price_mean',
+    'price_min', 'price_max'
+]
 ```
 
-This ensures `price_end` represents the price 30 days before resolution — genuinely uncertain territory — rather than 1-2 days before resolution where the outcome is nearly known. Requires re-running the full feature engineering pipeline.
+Remaining features:
+- `price_momentum` — direction of price movement over the window
+- `price_volatility` — stability of the market
+- `price_range` — how much the price moved
+- `log_total_volume` — total USD traded
+- `log_trade_count` — number of trades
+- `log_avg_trade_size` — average trade size
+- `buy_ratio` — proportion of BUY trades
+- `log_market_volume` — all-time market volume
+- `days_active` — total market duration
+- `days_to_resolution` — days remaining at end of window
+
+Also updated `scale_pos_weight` to reflect the actual class balance in the retrained dataset.
+
+### Retrained Model Results (v4)
+
+**Train vs Test:**
+
+| | Train | Test |
+|---|---|---|
+| Brier Score | 0.0950 | 0.0790 |
+| AUC-ROC | 0.9529 | 0.9399 |
+
+Overfitting gap reduced from 0.028 to 0.013 — model generalises significantly better.
+
+**Feature importance now distributed across all features:**
+
+| Feature | Importance |
+|---|---|
+| price_momentum | 33% |
+| days_to_resolution | 13% |
+| days_active | 11% |
+| buy_ratio | 11% |
+| price_volatility | 9% |
+| price_range | 5% |
+| log_avg_trade_size | 5% |
+| log_market_volume | 5% |
+| log_trade_count | 5% |
+| log_total_volume | 4% |
+
+No single feature dominates. Model is learning from genuine market dynamics.
+
+**Feature correlations with target (all below 0.55):**
+
+| Feature | Correlation |
+|---|---|
+| price_momentum | 0.5399 |
+| buy_ratio | 0.4953 |
+| price_volatility | 0.3488 |
+| log_avg_trade_size | 0.3455 |
+| price_range | 0.3405 |
+| log_market_volume | 0.1535 |
+| days_to_resolution | 0.1799 |
+| log_trade_count | 0.1169 |
+| log_total_volume | 0.2709 |
+| days_active | -0.1294 |
+
+**Calibration curve:** Still overconfident in the 0.3-0.6 range. Will be corrected with `CalibratedClassifierCV` before MAPIE.
+
+**Prediction distribution:** No longer strongly bimodal. Predictions are spread more naturally across the probability range with genuine uncertainty expressed in the middle range.
+
+### Model registered in MLflow as `polymarket-xgboost v4`
 
 ---
 
-## Current Status
+## Updated Metrics Summary
+
+| Model Version | Brier Score | AUC-ROC | Notes |
+|---|---|---|---|
+| Baseline | 0.0598 | 0.9724 | Default params, all features |
+| Optuna v2 | 0.0567 | 0.9717 | max_depth=8, overfitting identified |
+| Optuna v3 | 0.0573 | 0.9723 | max_depth capped, price_end removed — no improvement |
+| Optuna v4 | 0.0790 | 0.9399 | All price level features removed, genuine dynamics model |
+
+---
+
+## Updated Current Status
 
 | Stage | Status |
 |---|---|
@@ -401,11 +431,11 @@ This ensures `price_end` represents the price 30 days before resolution — genu
 | Baseline XGBoost + MLflow | ✅ Complete |
 | Optuna hyperparameter search | ✅ Complete |
 | Model analysis and overfitting checks | ✅ Complete |
-| Window strategy fix and retraining | 🔄 In progress |
-| Probability calibration | ⏳ Pending |
+| Model fixes and retraining | ✅ Complete |
+| Probability calibration | 🔄 Next |
 | Conformal prediction (MAPIE) | ⏳ Pending |
-| Live inference pipeline (`api.py`) | ⏳ Pending |
-| Streamlit app (`app.py`) | ⏳ Pending |
+| Live inference pipeline (api.py) | ⏳ Pending |
+| Streamlit app (app.py) | ⏳ Pending |
 | Backtest | ⏳ Pending |
 | README | ⏳ Pending |
 
