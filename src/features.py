@@ -32,7 +32,7 @@ class FeatureEngineer:
     def _load_data(self):
         try:
             self.markets = pl.read_parquet('data/processed/markets_political.parquet')
-            self.quant = pl.read_parquet('data/sample/quant_sample_political.parquet')
+            self.quant = pl.read_parquet('data/processed/quant_filtered.parquet')
         except Exception as e:
             logger.error(f"Error loading data: {e}")
 
@@ -71,7 +71,7 @@ class FeatureEngineer:
 
             window_trades = trades.filter(
                 (pl.col('datetime') >= window_start) &
-                (pl.col('datetime') <= end_date)
+                (pl.col('datetime') < end_date)
             )
 
             # Skip markets that don't have enough trades in the window
@@ -95,7 +95,7 @@ class FeatureEngineer:
             days_active = (m['end_date'] - m['created_at']).days
 
             # days_to_resolution: how many days were left at the end of the window
-            days_to_resolution = (m['end_date'] - latest_trade).days
+            days_to_resolution = (m['end_date'] - window_trades['datetime'].max()).days
 
             # ── Build feature row ────────────────────────────────────
             features = {
@@ -125,6 +125,8 @@ class FeatureEngineer:
                 'log_market_volume':  np.log1p(float(m['volume'])),
                 'days_active':        days_active,
                 'days_to_resolution': days_to_resolution,
+
+                'end_date': end_date
             }
 
             rows.append(features)
