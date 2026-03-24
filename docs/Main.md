@@ -358,6 +358,165 @@ Strongly bimodal — vast majority of predictions near 0 or near 1, very few in 
 
 ---
 
+
+
+## Stage 5 Update — Consistency Features Added (v5)
+
+### Motivation
+
+After identifying that the model relied too heavily on price level features, the v4 model removed all absolute price features and achieved AUC 0.9399. The next step was to add cross-market consistency features — a signal based on whether a market is mathematically mispriced relative to related markets in the same event.
+
+### What Are Consistency Features?
+
+Polymarket groups related markets under the same `event_id`. For mutually exclusive outcome markets (e.g. "Who will win the Republican primary?" with one market per candidate), all candidate prices should sum to 1.0. If they don't, some markets are mispriced relative to their siblings.
+
+This is different to a forecasting signal — it doesn't require predicting what will happen, just detecting mathematical inconsistencies between related markets.
+
+### Identifying Mutually Exclusive Markets — neg_risk
+
+Not all markets sharing an `event_id` are mutually exclusive. Two types exist:
+
+**Type 1 — Mutually exclusive (neg_risk = 1)**
+Exactly one outcome resolves YES. Prices should sum to 1.0. Consistency maths applies.
+Example: "Will Trump nominate X as Attorney General?" with multiple candidate markets.
+
+**Type 2 — Independent (neg_risk = 0)**
+Each market is a separate YES/NO question. Both can resolve YES. Prices have no mathematical relationship.
+Example: "Will Trump say X during speech?" repeated for many words.
+
+Verified empirically:
+- neg_risk = 1 events: median price sum = 1.0, 25th-75th percentile both at 1.0 ✅
+- neg_risk = 0 events: price sum wildly variable, no consistency relationship ✅
+
+Consistency features only applied to neg_risk = 1 markets. All others set to 0.
+
+Additional filter: only compute consistency for events where sibling prices sum between 0.7 and 1.3 — outside this range too many siblings are missing from the filtered dataset to trust the calculation.
+
+### Features Added
+
+**`consistency_gap`**
+How far this market's price is from its equal-share baseline across all markets in the event.
+```python
+consistency_gap = price_end - (1.0 / (n_siblings + 1))
+```
+
+Positive = overpriced relative to equal share.
+Negative = underpriced relative to equal share.
+Zero = not a neg_risk market or incomplete sibling data.
+
+**`n_siblings`**
+Number of related markets in the same event. Only populated for neg_risk = 1 markets.
+
+**`sibling_volume_ratio`**
+Log of total sibling volume divided by this market's volume. High ratio means siblings are more liquid — the consistency signal is more trustworthy.
+
+**`neg_risk`**
+Binary flag — is this market part of a mutually exclusive event? Added as a feature in its own right since mutually exclusive markets behave differently to independent ones.
+
+### Feature Matrix After Additions
+
+- Shape: 14,443 rows × 22 columns
+- 14 features used for training (4 new, all price level features still excluded)
+- Markets with active consistency signal: 5,861 (40% of dataset)
+- neg_risk = 1 markets: 6,518 (45% of dataset)
+- Zero nulls
+
+### Consistency Gap Distribution
+
+| Statistic | Value |
+|---|---|
+| Mean | 0.0004 |
+| Std | 0.178 |
+| Min | -0.499 |
+| Max | 0.967 |
+| Markets with active signal | 5,861 |
+
+Correctly bounded between -1 and +1, centred near zero.
+
+### Retrained Model Results (v5)
+
+**Train vs Test:**
+
+| | Train | Test |
+|---|---|---|
+| Brier Score | 0.0818 | 0.0731 |
+| AUC-ROC | 0.9682 | 0.9521 |
+| Log Loss | — | 0.2457 |
+
+Overfitting gap: 0.016 — healthy generalisation.
+
+**Feature importance:**
+
+| Feature | Importance |
+|---|---|
+| price_momentum | 25% |
+| consistency_gap | 19% |
+| days_to_resolution | 11% |
+| days_active | 9% |
+| sibling_volume_ratio | 7% |
+| buy_ratio | 5% |
+| price_volatility | 4% |
+| n_siblings | 3.5% |
+| price_range | 3.5% |
+| neg_risk | 3% |
+| log_trade_count | 3% |
+| log_avg_trade_size | 3% |
+| log_total_volume | 2.5% |
+| log_market_volume | 2.5% |
+
+`consistency_gap` jumped to second most important feature at 19%. No single feature dominates.
+
+**Feature correlations with target:**
+
+| Feature | Correlation |
+|---|---|
+| price_momentum | 0.5399 |
+| consistency_gap | 0.4249 |
+| buy_ratio | 0.4953 |
+| sibling_volume_ratio | -0.3929 |
+| neg_risk | -0.3390 |
+| price_volatility | 0.3488 |
+| log_avg_trade_size | 0.3455 |
+| price_range | 0.3405 |
+| n_siblings | -0.2811 |
+| log_total_volume | 0.2709 |
+| days_to_resolution | 0.1799 |
+| log_market_volume | 0.1535 |
+| log_trade_count | 0.1169 |
+| days_active | -0.1294 |
+
+All correlations below 0.55. No feature encoding the answer.
+
+**Calibration curve:** Still overconfident in the 0.3-0.6 range. Will be corrected with `CalibratedClassifierCV` before MAPIE.
+
+**Prediction distribution:** Less bimodal than v4. Still skewed towards low probabilities reflecting class imbalance. Will improve after calibration.
+
+### Model registered in MLflow as `polymarket-xgboost v5`
+
+---
+
+
+
+## Current Status
+
+| Stage | Status |
+|---|---|
+| Data extraction and validation | ✅ Complete |
+| Feature engineering | ✅ Complete |
+| Consistency features | ✅ Complete |
+| Time-based splits | ✅ Complete |
+| Baseline XGBoost + MLflow | ✅ Complete |
+| Optuna hyperparameter search | ✅ Complete |
+| Model analysis and overfitting checks | ✅ Complete |
+| Model fixes and retraining | ✅ Complete |
+| Probability calibration | 🔄 Next |
+| Conformal prediction (MAPIE) | ⏳ Pending |
+| Live inference pipeline (api.py) | ⏳ Pending |
+| Streamlit app (app.py) | ⏳ Pending |
+| Backtest | ⏳ Pending |
+| README | ⏳ Pending |
+
+
 ## Known Issues and Planned Fixes
 
 ### Root Cause
@@ -391,31 +550,13 @@ This ensures `price_end` represents the price 30 days before resolution — genu
 
 ---
 
-## Current Status
-
-| Stage | Status |
-|---|---|
-| Data extraction and validation | ✅ Complete |
-| Feature engineering | ✅ Complete |
-| Time-based splits | ✅ Complete |
-| Baseline XGBoost + MLflow | ✅ Complete |
-| Optuna hyperparameter search | ✅ Complete |
-| Model analysis and overfitting checks | ✅ Complete |
-| Window strategy fix and retraining | 🔄 In progress |
-| Probability calibration | ⏳ Pending |
-| Conformal prediction (MAPIE) | ⏳ Pending |
-| Live inference pipeline (`api.py`) | ⏳ Pending |
-| Streamlit app (`app.py`) | ⏳ Pending |
-| Backtest | ⏳ Pending |
-| README | ⏳ Pending |
-
----
 
 ## Metrics Summary
 
 | Model Version | Brier Score | AUC-ROC | Notes |
 |---|---|---|---|
-| Baseline | 0.0598 | 0.9724 | Default params, price_end included |
+| Baseline | 0.0598 | 0.9724 | Default params, all features including price levels |
 | Optuna v2 | 0.0567 | 0.9717 | max_depth=8, overfitting identified |
-| Optuna v3 | 0.0573 | 0.9723 | max_depth capped at 5, price_end removed — no meaningful improvement |
-| Retrained (planned) | TBD | TBD | New window strategy, 60-30 days before resolution |
+| Optuna v3 | 0.0573 | 0.9723 | max_depth capped, price_end removed — no improvement |
+| Optuna v4 | 0.0790 | 0.9399 | All price level features removed, genuine dynamics model |
+| Optuna v5 | 0.0731 | 0.9521 | Consistency features added, best overall result |

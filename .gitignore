@@ -1,3 +1,27 @@
-data/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Data files
+data/raw/
+data/processed/
+data/model/
+data/sample/
+
+# MLflow
 mlruns/
 mlflow.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+venv/
+.env
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

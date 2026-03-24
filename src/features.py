@@ -27,8 +27,6 @@ class FeatureEngineer:
 
         logger.info(f"Successfully initialized feature engineer")
 
-
-
     def _load_data(self):
         try:
             self.markets = pl.read_parquet('data/processed/markets_political.parquet')
@@ -136,15 +134,113 @@ class FeatureEngineer:
         logger.info(f"Feature matrix built: {feature_matrix.shape}")
 
         return feature_matrix
+    
+    def compute_consistency_features(self, feature_matrix):
+        '''
+        New consistency features, This function will run after the main feature matrix is created to add the additional features onto the feature matrix
         
+        Features added:
+        - consistency_gap - How far this market's price is from what siblings imply
+        - n_siblings - How many related amrekts exist in the same event
+        - sibling_volume_ratio - sibling total volume / this markets volume
+        '''
+        markets = self.markets.clone()
 
+        # Step 1 - Bring event_id and volume into the feature matrix. Join on condition_id (market_id in feature matrix)
+        enriched = feature_matrix.join(
+            markets.select(['condition_id', 'event_id', 'volume', 'neg_risk']),
+            left_on='market_id',
+            right_on='condition_id',
+            how='left'
+        )
 
+        # Step 2 - Compute sibling aggregates using window functions. For each market, sum price_end and volume of ALL markets in same event
+        # Then subtract this market's own values to get siblings only
+        enriched = enriched.with_columns([
+            # Total price_end sum for all markets in this event
+            pl.col('price_end').sum().over('event_id').alias('event_price_sum'),
+
+            # Total volume sum for all markets in this event
+            pl.col('volume').sum().over('event_id').alias('event_volume_sum'),
+
+            # Count of all markets in this event
+            pl.col('market_id').count().over('event_id').alias('event_market_count')
+        ])
+
+        # Step 3 - subtract this market's own values to get sibling-only values
+        enriched = enriched.with_columns([
+            # Sibling price sum = total event price sum minus this market'sprice
+            (pl.col('event_price_sum') - pl.col('price_end')).alias('sibling_price_sum'),
+
+            # Sibling volume sum = total event volume minus this market's volume
+            (pl.col('event_volume_sum') - pl.col('volume')).alias('sibling_volume_sum'),
+
+            # Number of siblings = total arkets in event minus this one
+            (pl.col('event_market_count') - 1).alias('n_siblings')
+        ])
+
+        # Step 4 - compute the three final features
+        enriched = enriched.with_columns([
+            # consistency_gap: Implied price = 1.0 - sibling_price_sum
+            # gap = actual price - implied price
+            # positive = overpriced vs siblings
+            # negative = underpriced vs siblings
+            # zero = no siblings
+            pl.when(
+                (pl.col('neg_risk') == 1) &
+                (pl.col('n_siblings') > 0) &
+                (pl.col('event_price_sum') >= 0.7) &
+                (pl.col('event_price_sum') <= 1.3)
+            ).then(
+                pl.col('price_end') - (1.0 / (pl.col('n_siblings') + 1))
+            ).otherwise(0.0)
+            .alias('consistency_gap'),
+
+            # n_siblings - Only meaningful for neg_risk = 1 markets
+            pl.when(pl.col('neg_risk') == 1)
+            .then(pl.col('n_siblings'))
+            .otherwise(0)
+            .alias('n_siblings'),
+            
+
+            # sibling_volume_ratio: How much more voluime do siblings have vs this market
+            # high = siblings are more liquid = consistency signal more trustworthy
+            # low = no siblings or this market has zero volume
+            pl.when(
+                (pl.col('neg_risk') == 1) &
+                (pl.col('n_siblings') > 0) &
+                (pl.col('volume') > 0)
+            ).then(
+                (pl.col('sibling_volume_sum') / pl.col('volume')).log1p()
+            ).otherwise(0.0)
+            .alias('sibling_volume_ratio')
+        ])
+
+        # Step 5 - drop intermediate columns, keep only the there new features
+        enriched = enriched.drop([
+            'event_id', 'volume', 'event_price_sum',
+            'event_volume_sum', 'event_market_count',
+            'sibling_price_sum', 'sibling_volume_sum'
+        ])
+
+        logger.info(f"Consistency features added. Shape: {enriched.shape}")
+        logger.info(f"neg_risk = 1 markets: {(enriched['neg_risk'] == 1).sum()}")
+        logger.info(f"neg_risk = 0 markets: {(enriched['neg_risk'] == 0).sum()}")
+        logger.info(f"Markets with active consistency signal: {(enriched['consistency_gap'] != 0).sum()}")
+
+        return enriched
+            
     
     def run(self):
+        # Step 1 - Apply existing feature engineering transformations 
         feature_matrix = self.feature_engineering()
+
+        # Step 2 - add consistency features
+        feature_matrix = self.compute_consistency_features(feature_matrix) 
 
         # Save feature matrix
         feature_matrix.write_parquet('data/processed/feature_matrix.parquet')
+        logger.info(f"Feature matrix saved: {feature_matrix.shape}")
 
 if __name__ == '__main__':
     FE = FeatureEngineer()
