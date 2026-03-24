@@ -421,31 +421,13 @@ No single feature dominates. Model is learning from genuine market dynamics.
 
 ---
 
-## Updated Current Status
-
-| Stage | Status |
-|---|---|
-| Data extraction and validation | ✅ Complete |
-| Feature engineering | ✅ Complete |
-| Time-based splits | ✅ Complete |
-| Baseline XGBoost + MLflow | ✅ Complete |
-| Optuna hyperparameter search | ✅ Complete |
-| Model analysis and overfitting checks | ✅ Complete |
-| Model fixes and retraining | ✅ Complete |
-| Probability calibration | 🔄 Next |
-| Conformal prediction (MAPIE) | ⏳ Pending |
-| Live inference pipeline (api.py) | ⏳ Pending |
-| Streamlit app (app.py) | ⏳ Pending |
-| Backtest | ⏳ Pending |
-| README | ⏳ Pending |
-
----
 
 ## Metrics Summary
 
 | Model Version | Brier Score | AUC-ROC | Notes |
 |---|---|---|---|
-| Baseline | 0.0598 | 0.9724 | Default params, price_end included |
+| Baseline | 0.0598 | 0.9724 | Default params, all features including price levels |
 | Optuna v2 | 0.0567 | 0.9717 | max_depth=8, overfitting identified |
-| Optuna v3 | 0.0573 | 0.9723 | max_depth capped at 5, price_end removed — no meaningful improvement |
-| Retrained (planned) | TBD | TBD | New window strategy, 60-30 days before resolution |
+| Optuna v3 | 0.0573 | 0.9723 | max_depth capped, price_end removed — no improvement |
+| Optuna v4 | 0.0790 | 0.9399 | All price level features removed, genuine dynamics model |
+| Optuna v5 | 0.0731 | 0.9521 | Consistency features added, best overall result |

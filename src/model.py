@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 TRAIN_SPLIT = 0.6
 CALIBRATION_SPLIT = 0.2
 TEST_SPLIT = 0.2
-SCALE_POS_WEIGHT = 2.47
+SCALE_POS_WEIGHT = 2.5723
 
 mlflow.set_experiment('polymarket-conformal')
 
