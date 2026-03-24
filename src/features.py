@@ -66,12 +66,12 @@ class FeatureEngineer:
             # ── Window boundaries ────────────────────────────────────
             # Using latest_trade for sample testing on laptop
             # Swap to end_date when running full dataset at home
-            latest_trade = trades['datetime'].max()
-            window_start = latest_trade - timedelta(days=LOOKBACK_DAYS)
+            end_date = m['end_date']
+            window_start = end_date - timedelta(days=LOOKBACK_DAYS)
 
             window_trades = trades.filter(
                 (pl.col('datetime') >= window_start) &
-                (pl.col('datetime') <= latest_trade)
+                (pl.col('datetime') <= end_date)
             )
 
             # Skip markets that don't have enough trades in the window
