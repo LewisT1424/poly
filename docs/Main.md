@@ -380,6 +380,131 @@ Alpha 0.10 (90% confidence) selected as default — best balance between signal 
 
 ---
 
+## Stage 6 Update — Backtest Results and Honest Assessment
+
+### Backtest Methodology
+
+Ran MAPIE prediction sets across the full test set (2,889 markets). For each market recorded signal type, true resolution, market price at prediction time, and whether the model disagreed with the market price. Profit calculations account for Polymarket's 2% fee on winnings.
+
+### Overall Signal Accuracy
+
+| Metric | Value |
+|---|---|
+| Total test markets | 2,889 |
+| GREEN signals | 702 → 83.9% accurate |
+| RED signals | 2,107 → 94.7% accurate |
+| YELLOW (uncertain) | 80 |
+| Overall accuracy | 92.0% |
+| Signal coverage | 97.2% |
+
+### Disagreement Analysis
+
+The more meaningful test — when the model disagrees with the market price, is it right?
+
+| Metric | Value |
+|---|---|
+| Total disagreement signals | 136 |
+| Disagreement accuracy | 40.4% |
+| Agreement accuracy | 94.7% |
+| Edge (disagreement - agreement) | -54.2% |
+| Avg profit per disagreement trade (after 2% fee) | +0.099 |
+
+**The model has no reliable edge over market prices.** When the model agrees with the market it is right 94.7% of the time. When it disagrees with the market it is right only 40.4% of the time — the market is more often correct.
+
+### Disagreement Accuracy By Price Range
+
+| Price Range | Disagreements | Accuracy | Interpretation |
+|---|---|---|---|
+| 0.0-0.1 | 6 | 16.7% | Model vs near-certain NO — almost always wrong |
+| 0.1-0.3 | 24 | 29.2% | Model vs strong NO — usually wrong |
+| 0.3-0.5 | 39 | 43.6% | Model vs moderate NO — below 50% |
+| 0.5-0.7 | 36 | 52.8% | Only range above 50% — marginal hint of edge |
+| 0.7-0.9 | 22 | 40.9% | Model vs moderate YES — below 50% |
+| 0.9-1.0 | 9 | 22.2% | Model vs near-certain YES — almost always wrong |
+
+### Why The Test Set Skews Results
+
+The test set is dominated by near-resolved markets:
+
+| Price Range | Count | % of Test Set |
+|---|---|---|
+| 0.0-0.1 | 1,745 | 60.4% |
+| 0.1-0.3 | 257 | 8.9% |
+| 0.3-0.5 | 149 | 5.2% |
+| 0.5-0.7 | 132 | 4.6% |
+| 0.7-0.9 | 136 | 4.7% |
+| 0.9-1.0 | 470 | 16.3% |
+
+76% of test markets are priced below 0.3 or above 0.7 — effectively already resolved. The model's momentum and volume signals cannot override near-certain market prices. The 136 disagreements are spread thinly across all ranges making statistical conclusions unreliable.
+
+The only potentially interesting range is 0.5-0.7 (52.8% accuracy, 36 samples) but this sample is far too small to confirm genuine edge.
+
+### Root Cause — Why The Model Cannot Beat The Market Alone
+
+The model only sees signals the market has already incorporated. Price momentum, volume, buy ratio and cross-market consistency are all visible to Polymarket traders. When these signals are already priced in, the model has no information advantage.
+
+The 92% overall accuracy comes from the model learning the same underlying patterns the market has already priced — not from finding genuine mispricings.
+
+### Honest Conclusion
+
+The current model is a well-built foundation but is not profitable as a standalone trading system. It is best understood as a baseline layer that filters which markets are worth monitoring.
+
+The path to genuine edge requires information the market has not yet priced:
+
+**Highest priority additions for V2:**
+
+**Cross-market consistency arbitrage** — detect mathematically inconsistent prices across related markets. Pure arbitrage requiring no forecasting accuracy. Academic research has documented $40M+ in historical Polymarket arbitrage from this source alone.
+
+**Informed wallet tracking** — the quant dataset contains every wallet address that has ever traded on Polymarket. Identifying historically accurate wallets and tracking their current positions would piggyback on genuine information advantage without requiring external data. Buildable entirely from existing data.
+
+**News sentiment timing** — pull headlines for each market topic, score sentiment and relevance via LLM, measure the gap between news sentiment and current price momentum. Markets where strong positive news hasn't yet moved the price represent genuine information lag.
+
+### What The Portfolio Project Demonstrates
+
+Despite the lack of trading edge, the project demonstrates a complete, honest ML pipeline:
+
+- End-to-end data engineering from 29GB of raw blockchain data
+- Principled feature engineering with documented leakage prevention
+- Multiple model iterations with honest identification and fixing of problems
+- Conformal prediction with mathematically guaranteed coverage
+- Honest backtest including disagreement analysis and fee accounting
+- Clear documentation of limitations and a credible path to improvement
+
+The disagreement analysis finding — that the market is efficient on these signals — is a more impressive and credible result than a backtest showing unrealistic returns.
+
+---
+
+## Updated Current Status
+
+| Stage | Status |
+|---|---|
+| Data extraction and validation | ✅ Complete |
+| Feature engineering | ✅ Complete |
+| Consistency features | ✅ Complete |
+| Time-based splits | ✅ Complete |
+| Model training (XGBoost v5) | ✅ Complete |
+| Model analysis and overfitting checks | ✅ Complete |
+| Probability calibration | ✅ Complete |
+| Conformal prediction (MAPIE) | ✅ Complete |
+| Backtest with disagreement analysis | ✅ Complete |
+| Live inference pipeline (api.py) | 🔄 Next |
+| Streamlit app (app.py) | ⏳ Pending |
+| README | ⏳ Pending |
+
+---
+
+## V2 Roadmap — Path To Genuine Edge
+
+| Feature | Effort | Expected Impact |
+|---|---|---|
+| Cross-market consistency arbitrage | 1-2 weeks | High — mechanical arbitrage, no forecasting required |
+| Informed wallet tracking | 2-3 weeks | High — piggybacks on existing smart money in dataset |
+| News sentiment timing signal | 3-4 weeks | High — genuine information lag on smaller markets |
+| Multi-horizon momentum features | 2-3 days | Low-medium — marginal improvement to existing model |
+| Restrict to uncertain markets (0.3-0.7) | 1 day | Medium — removes near-resolved noise from training |
+
+---
+
 ## Current Status
 
 | Stage | Status |
@@ -396,3 +521,4 @@ Alpha 0.10 (90% confidence) selected as default — best balance between signal 
 | Live inference pipeline (api.py) | ⏳ Pending |
 | Streamlit app (app.py) | ⏳ Pending |
 | README | ⏳ Pending |
+

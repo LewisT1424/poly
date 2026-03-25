@@ -16,6 +16,7 @@ EXCLUDE_COLS = [
     'price_start', 'price_end', 'price_mean',
     'price_min', 'price_max'
 ]
+POLYMARKET_FEE = 0.02 
 
 class CalibratedModel:
     '''
@@ -62,6 +63,8 @@ class Conformal:
         self.X_test = None
         self.y_test = None
 
+        self.test_prices = None
+
         # Load all data 
         self._load()
 
@@ -86,6 +89,7 @@ class Conformal:
             self.X_calib, self.y_calib = self._get_X_y(calibration) 
             self.X_test, self.y_test = self._get_X_y(test)
 
+            self.test_prices = test.select('price_end')
             logger.info(f"Successfully loaded model datasets and split into train, calibration, test splits")
         except Exception as e:
             logger.error(e)
@@ -413,12 +417,206 @@ class Conformal:
         }
 
 
+    def backtest(self):
+        try:
+            # Get prediction sets for all test markets
+            y_pred, y_pred_sets = self.mapie_model.predict_set(
+                self.X_test.to_numpy()
+            )
+
+            # Get market prices for disagreement analysis
+            market_prices = self.test_prices.to_numpy().ravel()
+
+            y_true = self.y_test.to_numpy().ravel().astype(int)
+            n_samples = len(y_true)
+
+            results = []
+
+            for i in range(n_samples):
+                market_price = float(market_prices[i])
+                # Get signal for thism market using current_price=0.5 as placeholder
+                # In production this would be the live market price
+                signal = self.predict_signal(y_pred_sets[i], current_price=market_price)
+                true_label = y_true[i]
+
+                if signal['signal'] == 'GREEN':
+                    disagreement = market_price < 0.5
+                    # Green is correct if market actually resolved YES (1)
+                    correct = bool(true_label == 1)
+                    if correct:
+                        gross = 1.0 - market_price
+                        profit = gross - (gross * POLYMARKET_FEE)
+                    else:
+                        profit = -market_price # no fee on loses
+
+                elif signal['signal'] == 'RED':
+                    disagreement = market_price > 0.5
+                    # RED is correct if market actually resolved NO (0)
+                    correct = bool(true_label == 0)
+                    if correct:
+                        gross = market_price
+                        profit = gross - (gross * POLYMARKET_FEE)
+                    else:
+                        profit = -(1.0 - market_price) # No fee on loses
+
+                else:
+                    disagreement = False
+                    correct = None
+                    profit = 0.0
+                
+                results.append({
+                    'signal': signal['signal'],
+                    'correct': correct,
+                    'true_label': true_label,
+                    'market_price': market_price,
+                    'disagreement': disagreement,
+                    'profit': profit
+                })
+
+            # Add this temporarily before pl.DataFrame(results)
+            results_df = pl.DataFrame(results).with_columns(
+                pl.col('correct').cast(pl.Boolean)
+            )
+            
+
+            # Seperate by signal type for accuracy calculations
+            green = results_df.filter(pl.col('signal') == 'GREEN')
+            red = results_df.filter(pl.col('signal') == 'RED')
+            actionable = results_df.filter(pl.col('signal') != 'YELLOW')
+
+            # Calculate accuracy per signal type
+            # If no signals of type exists, default to 0.0
+            green_accuracy = green['correct'].mean() if len(green) > 0 else 0.0
+            red_accuracy = red['correct'].mean() if len(red) > 0 else 0.0
+            overall_accuracy = actionable['correct'].mean() if len(actionable) > 0 else 0.0
+
+            # Disagreement analysis
+            disagree = actionable.filter(pl.col('disagreement') == True)
+            agree = actionable.filter(pl.col('disagreement') == False)
+
+            disagree_accuracy = disagree['correct'].mean() if len(disagree) > 0 else 0.0
+            agree_accuracy = agree['correct'].mean() if len(agree) > 0 else 0.0
+            avg_profit = disagree['profit'].mean() if len(disagree) >0 else 0.0
+            edge = float(disagree_accuracy) - float(agree_accuracy)
+
+            # Signal coverage - what proportion of markets got an actionable signal
+            signal_coverage = len(actionable) / n_samples
+            
+
+            # Log all backtest metrics to MLflow
+            with mlflow.start_run(run_name='backtest', nested=True):
+                mlflow.log_metric('green_accuracy', float(green_accuracy))
+                mlflow.log_metric('red_accuracy', float(red_accuracy))
+                mlflow.log_metric('overall_accuracy', float(overall_accuracy))
+                mlflow.log_metric('signal_coverage', float(signal_coverage))
+                mlflow.log_metric('n_green', len(green))
+                mlflow.log_metric('n_red', len(red))
+                mlflow.log_metric('n_yellow', len(results_df.filter(pl.col('signal') == 'YELLOW')))
+                mlflow.log_metric('disagree_accuracy', float(disagree_accuracy))
+                mlflow.log_metric('agree_accuracy', float(agree_accuracy))
+                mlflow.log_metric('avg_profit', float(avg_profit))
+                mlflow.log_metric('edge', float(edge))
+                mlflow.log_metric('n_disagreements', len(disagree))
+
+            # Plot signal accuracy bar chart
+            fig, ax = plt.subplots(figsize=(8, 5))
+            signals = ['GREEN', "RED", 'Overall']
+            accuracies = [float(green_accuracy), float(red_accuracy), float(overall_accuracy)]
+            colours = ['green', 'red', 'steelblue']
+
+            bars = ax.bar(signals, accuracies, color=colours, alpha=0.7, edgecolor='black')
+            ax.axhline(y=0.5, linestyle='--', color='grey', label='Random baseline (50%)')
+            ax.set_ylabel('Accuracy')
+            ax.set_title('Backtest Signal Accuracy')
+            ax.set_ylim(0, 1)
+            ax.legend()
+
+            # Add accuracy value lables on top of each bar
+            for bar, acc in zip(bars, accuracies):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.01,
+                    f'{acc:.1%}',
+                    ha='center', va='bottom', fontweight='bold'
+                )
+
+            plt.tight_layout()
+            plt.savefig('backtest_accuracy.png')
+            plt.close()
+
+            # Log chat to mlflow
+            with mlflow.start_run(run_name='backtest', nested=True):
+                mlflow.log_artifact('backtest_accuracy.png')
+
+            # Print results
+            logger.info(f"Total test markets:    {n_samples}")
+            logger.info(f"GREEN signals:         {len(green)} → {float(green_accuracy):.1%} accurate")
+            logger.info(f"RED signals:           {len(red)} → {float(red_accuracy):.1%} accurate")
+            logger.info(f"YELLOW (uncertain):    {len(results_df.filter(pl.col('signal') == 'YELLOW'))}")
+            logger.info(f"Overall accuracy:      {float(overall_accuracy):.1%}")
+            logger.info(f"Signal coverage:       {float(signal_coverage):.1%}")
+
+
+            # Honest interpretation
+            if float(overall_accuracy) > 0.65:
+                logger.info("Signal quality: STRONG — meaningfully above random baseline")
+            elif float(overall_accuracy) > 0.55:
+                logger.info("Signal quality: MODERATE — above random but marginal edge")
+            else:
+                logger.info("Signal quality: WEAK — close to random baseline, review model")
+
+            logger.info(f"--- Disagreement Analysis ---")
+            logger.info(f"Disagreement signals:  {len(disagree)}")
+            logger.info(f"Disagreement accuracy: {float(disagree_accuracy):.1%}")
+            logger.info(f"Agreement accuracy:    {float(agree_accuracy):.1%}")
+            logger.info(f"Edge:                  {float(edge):+.1%}")
+            logger.info(f"Avg profit per trade:  {float(avg_profit):.3f}")
+
+            if float(edge) > 0.05:
+                logger.info("Edge assessment: POSITIVE — model adds value beyond market price")
+            elif float(edge) > 0:
+                logger.info("Edge assessment: MARGINAL — small positive edge, needs more data")
+            else:
+                logger.info("Edge assessment: NONE — model does not beat market price alone")
+
+
+            logger.info('----------------------------------------------')
+            # At the end of the backtest loop, save results with price
+            results_df = results_df.with_columns(
+                pl.Series('market_price', market_prices)
+            )
+
+            # Filter to disagreements only
+            disagreements = results_df.filter(pl.col('disagreement') == True)
+
+            # Bin the disagreement prices
+            disagreements_binned = disagreements.with_columns(
+                pl.when(pl.col('market_price') < 0.1).then(pl.lit('0.0-0.1'))
+                .when(pl.col('market_price') < 0.3).then(pl.lit('0.1-0.3'))
+                .when(pl.col('market_price') < 0.5).then(pl.lit('0.3-0.5'))
+                .when(pl.col('market_price') < 0.7).then(pl.lit('0.5-0.7'))
+                .when(pl.col('market_price') < 0.9).then(pl.lit('0.7-0.9'))
+                .otherwise(pl.lit('0.9-1.0'))
+                .alias('price_bin')
+            )
+
+            print(disagreements_binned.group_by('price_bin').agg([
+                pl.col('market_price').count().alias('count'),
+                pl.col('correct').mean().alias('accuracy')
+            ]).sort('price_bin'))
+
+            return results_df
+
+        except Exception as e:
+            logger.error(f"Error happened during backtest: {e}")
+
     def run(self):
         with mlflow.start_run(run_name='conformal_pipeline'):
             self.calibrate()
             self.conformalize()
             self.verify_coverage()
             self.explore_alpha()
+            self.backtest()
 
             # Register MAPIE model in MLflow
             mlflow.sklearn.log_model(
@@ -433,18 +631,8 @@ class Conformal:
             mlflow.log_param('conformity_score', 'lac')
 
             logger.info("Confromal pipeline complete")
+
+
 if __name__ == '__main__':
     cp = Conformal()
-    cp.calibrate()
-    cp.conformalize()
-
-
-    # Sample markets spread across the test set
-    indices = [0, 200, 500, 1000, 1500, 2000, 2500, 2800]
-
-    y_pred, y_pred_sets = cp.mapie_model.predict_set(cp.X_test.to_numpy())
-    y_true = cp.y_test.to_numpy().ravel().astype(int)
-
-    for i in indices:
-        signal = cp.predict_signal(y_pred_sets[i], current_price=0.5)
-        print(f"Market {i} | True: {'YES' if y_true[i] else 'NO'} | Signal: {signal['signal']} | {signal['description']}")
+    cp.run()
