@@ -15,7 +15,7 @@
 - **Python 3.11** — core language
 - **Polars** — data loading, filtering, feature engineering
 - **XGBoost** — classification model
-- **MAPIE** — conformal prediction wrapper (to be implemented)
+- **MAPIE 1.3** — conformal prediction wrapper
 - **MLflow** — experiment tracking, model registry
 - **Streamlit** — live inference app (to be built)
 - **Polymarket REST API** — live market data at inference time
@@ -35,7 +35,7 @@
     /processed
       markets_political.parquet       ← 20,584 filtered political markets
       quant_political.parquet         ← 31.7M trades for political markets
-      feature_matrix.parquet          ← 14,443 markets, 17 features
+      feature_matrix.parquet          ← 14,443 markets, 22 columns
     /model
       train.parquet                   ← 8,665 markets (60%, 2022-2025)
       calibration.parquet             ← 2,889 markets (20%, 2025)
@@ -43,6 +43,7 @@
   /src
     features.py                       ← feature engineering class
     model.py                          ← training, evaluation, MLflow
+    conformal.py                      ← calibration, MAPIE, signal function
   /notebooks
     model-analysis.ipynb              ← overfitting and calibration checks
   mlruns/                             ← MLflow experiment runs
@@ -145,9 +146,9 @@ quant.with_columns(
 
 **Single function for training and inference:** All feature engineering lives in `features.py` and is called identically for both historical training data and live API data at inference time. This prevents training/inference skew — the most common silent failure in production ML.
 
-**Lookback window approach:** Rather than using all available trade history, features are computed from a fixed 30-day window before each market's resolution date. This simulates what would be known at inference time.
+**Lookback window approach:** Features are computed from a fixed 30-day window before each market's resolution date. This simulates what would be known at inference time.
 
-**Leakage protection:** Any trade on or after `end_date` is excluded. This is critical — trades on resolution day have prices near 0 or 1 because the outcome is already known.
+**Leakage protection:** Any trade on or after `end_date` is excluded. Trades on resolution day have prices near 0 or 1 because the outcome is already known.
 
 ### Constants
 ```python
@@ -185,8 +186,6 @@ For each market:
 | `log_trade_count` | Number of individual trades | log1p applied |
 | `log_avg_trade_size` | Mean USD per trade | log1p applied |
 
-Log1p transformation applied to all volume features because raw volume ranges from $0 to $1.5B — without transformation it would dominate the model.
-
 **Sentiment:**
 
 | Feature | Description |
@@ -201,11 +200,25 @@ Log1p transformation applied to all volume features because raw volume ranges fr
 | `days_active` | Days between `created_at` and `end_date` | |
 | `days_to_resolution` | Days remaining at end of lookback window | |
 
+**Cross-market consistency features (neg_risk = 1 markets only):**
+
+| Feature | Description |
+|---|---|
+| `consistency_gap` | How far this market's price deviates from equal-share baseline across siblings |
+| `n_siblings` | Number of related markets in the same event |
+| `sibling_volume_ratio` | Log of sibling total volume / this market's volume |
+| `neg_risk` | Binary flag — mutually exclusive event (1) or independent (0) |
+
+Consistency features only computed for `neg_risk = 1` markets — these are mutually exclusive outcome markets where prices should sum to 1.0. Independent markets (`neg_risk = 0`) get 0 for all consistency features.
+
+Additional filter: only compute consistency where sibling prices sum between 0.7 and 1.3 — outside this range too many siblings are missing.
+
 ### Feature Matrix Output
 
-- **14,443 markets** processed successfully (down from 20,111 — remainder had fewer than 10 trades in the 30-day window)
-- **17 columns** total (market_id, resolved_yes, 15 features)
-- **Zero nulls** across all columns
+- **14,443 markets** processed
+- **22 columns** total
+- **14 features** used for training (price level features excluded at model stage)
+- **Zero nulls**
 - **Class balance:** 28% YES / 72% NO
 
 ---
@@ -214,21 +227,7 @@ Log1p transformation applied to all volume features because raw volume ranges fr
 
 ### Why Time-Based Not Random
 
-Political markets behave differently across time — Polymarket in 2022 was a small platform, by 2025 it was a major market with different liquidity and participant dynamics. A random split would mix time periods and overstate how well the model generalises to genuinely future markets.
-
 Splitting chronologically by `end_date` simulates real-world performance: train on old markets, evaluate on newer ones the model has never seen.
-
-### Split Logic
-```python
-data_copy = feature_matrix.sort('end_date')
-n = len(data_copy)
-train_cutoff = int(n * 0.60)
-calib_cutoff = int(n * 0.80)
-
-train       = data_copy[:train_cutoff]
-calibration = data_copy[train_cutoff:calib_cutoff]
-test        = data_copy[calib_cutoff:]
-```
 
 ### Split Results
 
@@ -238,105 +237,15 @@ test        = data_copy[calib_cutoff:]
 | Calibration | 2,889 | Nov 2025 → Jan 2026 | 25.34% |
 | Test | 2,889 | Jan 2026 → Apr 2026 | 25.16% |
 
-**Note:** YES rate drops from train to test. Recent markets (2025-2026) have more NO resolutions, likely because more speculative short-duration markets were created in that period. Noted as a known limitation.
-
-**Why three splits:** The calibration set is reserved exclusively for MAPIE. MAPIE uses it to calculate what interval width guarantees 90% coverage. If calibration data leaked into training, the coverage guarantee would break silently.
+**Why three splits:** The calibration set is reserved exclusively for MAPIE. If calibration data leaked into training the coverage guarantee would break silently.
 
 ---
 
 ## Stage 4 — Model Training (`src/model.py`)
 
-### MLflow Setup
+### Feature Set Used for Training
 
-Experiment name: `polymarket-conformal`
-
-All runs logged with:
-- Parameters
-- Metrics: Brier Score, AUC-ROC, Log Loss
-- Artifacts: model file
-
-### Baseline Model
-```python
-params = {
-    'scale_pos_weight': 2.47,  # ratio of NO to YES: 10400/4043
-    'n_estimators': 300,
-    'learning_rate': 0.05,
-    'max_depth': 4,
-    'subsample': 0.8,
-    'min_child_weight': 5,
-    'eval_metric': 'logloss',
-    'random_state': 42,
-}
-```
-
-**Why `scale_pos_weight = 2.47`:** Dataset is 72% NO / 28% YES. Without correction XGBoost is biased towards predicting NO for everything. This weight tells XGBoost to treat each YES market as 2.47x more important during training.
-
-**Baseline results:**
-
-| Metric | Value |
-|---|---|
-| Brier Score | 0.0598 |
-| AUC-ROC | 0.9724 |
-| Log Loss | 0.1909 |
-
-### Hyperparameter Search with Optuna
-
-100 trials, each logged as a nested MLflow child run under a parent `optuna_search` run.
-
-**Search space:**
-```python
-'n_estimators':     trial.suggest_int('n_estimators', 100, 500)
-'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
-'max_depth':        trial.suggest_int('max_depth', 3, 5)
-'subsample':        trial.suggest_float('subsample', 0.6, 1.0)
-'min_child_weight': trial.suggest_int('min_child_weight', 1, 10)
-'reg_alpha':        trial.suggest_float('reg_alpha', 0.01, 1.0)
-'reg_lambda':       trial.suggest_float('reg_lambda', 0.01, 1.0)
-'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0)
-```
-
-**Final model results (version 3):**
-
-| Metric | Value |
-|---|---|
-| Brier Score | 0.0573 |
-| AUC-ROC | 0.9723 |
-
-Model registered in MLflow registry as `polymarket-xgboost v3`.
-
----
-
----
-
-## Stage 5 Update — Model Fixes and Retraining
-
-### Problem Identified
-
-After initial model analysis, all price level features were found to be highly correlated with the target variable:
-
-| Feature | Correlation with resolved_yes |
-|---|---|
-| price_end | 0.8399 |
-| price_mean | 0.7869 |
-| price_min | 0.6380 |
-| price_max | 0.6241 |
-| price_start | 0.4833 |
-
-This was because the majority of markets in the dataset are measured very close to their resolution date — the price already encodes the answer. The model was reading a nearly-resolved price rather than genuinely predicting from uncertainty.
-
-### Attempted Fixes
-
-**Attempt 1 — Remove price_end only**
-Updated `EXCLUDE_COLS` to include `price_end`. Model performance unchanged — Brier 0.0573, AUC 0.9723. The model simply shifted importance to `price_mean` which carries near-identical information.
-
-**Attempt 2 — Change window strategy to 60-30 days before resolution**
-Investigated using a window 60-30 days before resolution to force genuinely uncertain predictions. Only 2,621 markets had sufficient trades in this window — too thin for reliable training and MAPIE calibration. Ruled out.
-
-**Attempt 3 — Change window strategy to 45-15 days before resolution**
-Even fewer viable markets at 2,389. Ruled out.
-
-**Final fix — Remove all price level features**
-Removed `price_start`, `price_end`, `price_mean`, `price_min`, `price_max` from the feature set entirely. Kept only dynamic and metadata features:
+Price level features excluded to prevent the model reading near-resolved prices:
 ```python
 EXCLUDE_COLS = [
     'market_id', 'resolved_yes', 'end_date',
@@ -345,89 +254,145 @@ EXCLUDE_COLS = [
 ]
 ```
 
-Remaining features:
-- `price_momentum` — direction of price movement over the window
-- `price_volatility` — stability of the market
-- `price_range` — how much the price moved
-- `log_total_volume` — total USD traded
-- `log_trade_count` — number of trades
-- `log_avg_trade_size` — average trade size
-- `buy_ratio` — proportion of BUY trades
-- `log_market_volume` — all-time market volume
-- `days_active` — total market duration
-- `days_to_resolution` — days remaining at end of window
+14 features used: `price_momentum`, `price_volatility`, `price_range`, `log_total_volume`, `log_trade_count`, `log_avg_trade_size`, `buy_ratio`, `log_market_volume`, `days_active`, `days_to_resolution`, `neg_risk`, `n_siblings`, `consistency_gap`, `sibling_volume_ratio`
 
-Also updated `scale_pos_weight` to reflect the actual class balance in the retrained dataset.
-
-### Retrained Model Results (v4)
+### Final Model Results (v5)
 
 **Train vs Test:**
 
 | | Train | Test |
 |---|---|---|
-| Brier Score | 0.0950 | 0.0790 |
-| AUC-ROC | 0.9529 | 0.9399 |
+| Brier Score | 0.0818 | 0.0731 |
+| AUC-ROC | 0.9682 | 0.9521 |
+| Log Loss | — | 0.2457 |
 
-Overfitting gap reduced from 0.028 to 0.013 — model generalises significantly better.
+Overfitting gap: 0.016 — healthy generalisation.
 
-**Feature importance now distributed across all features:**
+**Feature importance:**
 
 | Feature | Importance |
 |---|---|
-| price_momentum | 33% |
-| days_to_resolution | 13% |
-| days_active | 11% |
-| buy_ratio | 11% |
-| price_volatility | 9% |
-| price_range | 5% |
-| log_avg_trade_size | 5% |
-| log_market_volume | 5% |
-| log_trade_count | 5% |
-| log_total_volume | 4% |
+| price_momentum | 25% |
+| consistency_gap | 19% |
+| days_to_resolution | 11% |
+| days_active | 9% |
+| sibling_volume_ratio | 7% |
+| buy_ratio | 5% |
+| price_volatility | 4% |
+| All others | 2-3% each |
 
-No single feature dominates. Model is learning from genuine market dynamics.
-
-**Feature correlations with target (all below 0.55):**
-
-| Feature | Correlation |
-|---|---|
-| price_momentum | 0.5399 |
-| buy_ratio | 0.4953 |
-| price_volatility | 0.3488 |
-| log_avg_trade_size | 0.3455 |
-| price_range | 0.3405 |
-| log_market_volume | 0.1535 |
-| days_to_resolution | 0.1799 |
-| log_trade_count | 0.1169 |
-| log_total_volume | 0.2709 |
-| days_active | -0.1294 |
-
-**Calibration curve:** Still overconfident in the 0.3-0.6 range. Will be corrected with `CalibratedClassifierCV` before MAPIE.
-
-**Prediction distribution:** No longer strongly bimodal. Predictions are spread more naturally across the probability range with genuine uncertainty expressed in the middle range.
-
-### Model registered in MLflow as `polymarket-xgboost v4`
+**Model registered in MLflow as `polymarket-xgboost v5`**
 
 ---
 
-## Updated Metrics Summary
+## Stage 5 — Model Iteration History
 
-| Model Version | Brier Score | AUC-ROC | Notes |
+| Version | Brier | AUC | Notes |
 |---|---|---|---|
 | Baseline | 0.0598 | 0.9724 | Default params, all features |
-| Optuna v2 | 0.0567 | 0.9717 | max_depth=8, overfitting identified |
-| Optuna v3 | 0.0573 | 0.9723 | max_depth capped, price_end removed — no improvement |
-| Optuna v4 | 0.0790 | 0.9399 | All price level features removed, genuine dynamics model |
+| v2 | 0.0567 | 0.9717 | Optuna search, max_depth=8, overfitting identified |
+| v3 | 0.0573 | 0.9723 | max_depth capped at 5, price_end removed — no improvement |
+| v4 | 0.0790 | 0.9399 | All price level features removed, genuine dynamics model |
+| v5 | 0.0731 | 0.9521 | Consistency features added, best overall result |
 
 ---
 
+## Stage 6 — Probability Calibration + Conformal Prediction (`src/conformal.py`)
 
-## Metrics Summary
+### Overview
 
-| Model Version | Brier Score | AUC-ROC | Notes |
-|---|---|---|---|
-| Baseline | 0.0598 | 0.9724 | Default params, all features including price levels |
-| Optuna v2 | 0.0567 | 0.9717 | max_depth=8, overfitting identified |
-| Optuna v3 | 0.0573 | 0.9723 | max_depth capped, price_end removed — no improvement |
-| Optuna v4 | 0.0790 | 0.9399 | All price level features removed, genuine dynamics model |
-| Optuna v5 | 0.0731 | 0.9521 | Consistency features added, best overall result |
+`conformal.py` takes the trained XGBoost v5 model and wraps it with:
+1. Platt scaling to correct probability miscalibration
+2. MAPIE `SplitConformalClassifier` to produce guaranteed prediction sets
+
+### Why Probability Calibration First
+
+XGBoost's raw probability outputs were overconfident in the 0.3-0.6 range — the calibration curve dipped below the diagonal. MAPIE's conformity scores are built directly from probability outputs so miscalibrated probabilities produce unreliable intervals.
+
+### Platt Scaling Implementation
+
+`CalibratedClassifierCV` with `cv='prefit'` was removed in sklearn 1.8. Implemented manually:
+```python
+# Get raw XGBoost probabilities on calibration set
+raw_calib_probs = xgb_model.predict_proba(X_calib)[:, 1].reshape(-1, 1)
+
+# Fit logistic regression correction on top — Platt scaling
+platt = LogisticRegression()
+platt.fit(raw_calib_probs, y_calib)
+```
+
+Wrapped in a `CalibratedModel` class with `predict_proba` and `predict` methods to maintain sklearn compatibility with MAPIE.
+
+**Calibration results:**
+- Brier Score before: 0.0731
+- Brier Score after: 0.0692
+- Curve moved closer to diagonal in 0.3-0.6 range
+
+### Conformal Prediction with MAPIE
+
+Used `SplitConformalClassifier` with LAC conformity score. APS is restricted to multiclass in MAPIE 1.3 — for binary classification LAC produces equivalent results.
+```python
+mapie = SplitConformalClassifier(
+    estimator=calib_model,
+    confidence_level=0.9,
+    conformity_score='lac',
+    prefit=True
+)
+mapie.conformalize(X_calib, y_calib)
+```
+
+### Coverage Verification
+
+| Metric | Value |
+|---|---|
+| Empirical coverage | 0.9225 ✅ (must be ≥ 0.90) |
+| Signal rate | 0.9723 |
+| Ambiguity rate | 0.0277 |
+| YES signals | 702 |
+| NO signals | 2,107 |
+| Uncertain | 80 |
+
+Coverage of 92.25% confirms the mathematical guarantee is holding on the test set.
+
+### Alpha Exploration
+
+| Alpha | Confidence | Coverage | Signal Rate | Ambiguity |
+|---|---|---|---|---|
+| 0.05 | 95% | 0.9533 | 87.8% | 12.2% |
+| 0.10 | 90% | 0.9225 | 97.2% | 2.8% |
+| 0.20 | 80% | 0.8394 | 100% | 0.0% |
+
+Alpha 0.10 (90% confidence) selected as default — best balance between signal rate and coverage guarantee. Alpha 0.20 drops below 80% coverage which is too low.
+
+### Mispricing Signal Function
+```
+{YES} prediction set → 🟢 GREEN — model confident YES
+{NO}  prediction set → 🔴 RED   — model confident NO
+{YES, NO}            → 🟡 YELLOW — model uncertain, no signal
+```
+
+### Known Limitations
+
+- Probability calibration and conformalization share the same calibration set — a cross-calibration approach would eliminate the minor leakage at the cost of implementation complexity. Empirical coverage of 92.25% confirms the approach is working acceptably
+- Signal rate of 97% is high — the model is confident on almost every market. Combined with some remaining overconfidence, the backtest will determine whether confident signals are actually reliable
+
+**MAPIE model registered in MLflow as `polymarket-mapie v1`**
+
+---
+
+## Current Status
+
+| Stage | Status |
+|---|---|
+| Data extraction and validation | ✅ Complete |
+| Feature engineering | ✅ Complete |
+| Consistency features | ✅ Complete |
+| Time-based splits | ✅ Complete |
+| Model training (XGBoost v5) | ✅ Complete |
+| Model analysis and overfitting checks | ✅ Complete |
+| Probability calibration | ✅ Complete |
+| Conformal prediction (MAPIE) | ✅ Complete |
+| Backtest | 🔄 Next |
+| Live inference pipeline (api.py) | ⏳ Pending |
+| Streamlit app (app.py) | ⏳ Pending |
+| README | ⏳ Pending |
