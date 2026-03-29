@@ -5,8 +5,9 @@ This will be used by iniital training data (historical data), and inference data
 '''
 import polars as pl
 import logging
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 import numpy as np
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -229,6 +230,105 @@ class FeatureEngineer:
         logger.info(f"Markets with active consistency signal: {(enriched['consistency_gap'] != 0).sum()}")
 
         return enriched
+    
+    def compute_features_for_market(self, condition_id: str, trades: pl.DataFrame, market_meta: pl.DataFrame) -> pl.DataFrame:
+        '''
+        Compute features for a single live market at inference time.
+
+        Mirrors feature_engineering() and compute_consistency_features() exactly for a single market. 
+        Called by app.py for live signals.
+
+        Params:
+        - condition_id - Market condition ID from api.get_market_by_slug()
+        - trades - pl.Dataframe - Recent trades from api.get_recent_trades
+        - market_meta - pl.Dataframe - Singke-row DataFrame from api.get_market_by_slug() - Must have volume, neg_risk, end_date columns
+        
+        Returns:
+        - pl.DataFrame - single row matching feature_matrix.parquet schema
+        '''
+        # Sort trades chronologically
+        trades = trades.sort('datetime', descending=False)
+
+        # Price features
+        price_series = trades['price']
+
+        price_start = float(price_series.first())
+        price_end = float(price_series.last())
+        price_mean = float(price_series.mean())
+        price_min = float(price_series.min())
+        price_max =  float(price_series.max())
+        price_volatility = float(price_series.std()) if len(trades) > 1 else 0.0
+        price_range = price_max - price_min
+        price_momentum = price_end - price_start
+
+        # volume features (log1p transformed)
+        total_volume = float(trades['usd_amount'].sum())
+        trade_count = len(trades)
+        avg_trade_size = total_volume / trade_count if trade_count > 0 else 0.0
+
+        log_total_volumme = math.log1p(total_volume)
+        log_trade_count = math.log1p(trade_count)
+        log_avg_trade_size = math.log1p(avg_trade_size)
+
+        # Sentiment
+        n_buys = trades.filter(pl.col('side') == 'BUY').height
+        buy_ratio = n_buys / trade_count if trade_count > 0 else 0.5
+
+        # Market metadata
+        market_volume = float(market_meta['volume'][0])
+        log_market_volume  = math.log1p(market_volume)
+        neg_risk = int(market_meta['neg_risk'][0])
+
+        # days_active: created_at not available from REST API
+        # Approximate from span of trades in the window
+        sorted_dates = trades['datetime'].sort()
+        first_trade = sorted_dates[0]
+        last_trade = sorted_dates[-1]
+        diff = last_trade - first_trade
+        days_active = max(1, int(diff.days) if hasattr(diff, 'days') else 1)
+
+        # days_to_resolution: end_date - now
+        end_date_str = str(market_meta['end_date'][0])
+        try:
+            end_dt = datetime.fromisoformat(
+                end_date_str.replace('Z', '+00:00')
+            )
+            now = datetime.now(timezone.utc)
+            days_to_resolution = max(0, (end_dt, now).days)
+        except Exception:
+            days_to_resolution = 0
+
+        # Consistency features - default to 0.0 at portfolio stage
+        # Phase 3 blockchain.py will add live sibling queries
+        consistency_gap = 0
+        n_siblings = 0
+        sibling_volume_ratio = 0
+
+        # Bild single_row DataFrame matching feature_matrix schema
+        return pl.DataFrame({
+            'market_id': [condition_id],
+            'resolved_yes': [False], # Unknown at inference
+            'price_start': [price_start],
+            'price_end': [price_end],
+            'price_mean': [price_mean],
+            'price_min': [price_min],
+            'price_max': [price_max],
+            'price_volatility': [price_volatility],
+            'price_range': [price_range],
+            'price_momentum': [price_momentum],
+            'log_total_volume': [log_total_volumme],
+            'log_trade_count': [log_trade_count],
+            'log_avg_trade_size': [log_avg_trade_size],
+            'buy_ratio': [buy_ratio],
+            'log_market_volume': [log_market_volume],
+            'days_active': [float(days_active)],
+            'days_to_resolution': [float(days_to_resolution)],
+            'neg_risk': [neg_risk],
+            'n_siblings': [n_siblings],
+            'consistency_gap': [consistency_gap],
+            'sibling_volume_ratio': [sibling_volume_ratio],
+            'end_date': [end_date_str]
+        })
             
     
     def run(self):
