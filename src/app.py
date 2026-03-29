@@ -24,6 +24,11 @@ sys.path.append(os.path.dirname(__file__))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from api import (
+    get_market_by_slug, get_recent_trades, MarketNotFound, MarketAlreadyResolvedError,
+    InsufficientTradesError, APIError
+)
+
 # Page config
 st.set_page_config(
     page_title='Polymarket Conformal Predictor',
@@ -44,7 +49,7 @@ SIGNAL_COLOURS = {
 }
 
 # Model loading (cached)
-st.cache_resource
+@st.cache_resource
 def load_models():
     '''Load XGBoost and MAPIE models from MLflow. Returns (xgb, mapie) or (None, None)'''
     try:
@@ -59,7 +64,7 @@ def load_models():
 def load_splits():
     '''Load train/calibration/test parquets. Returns dict or None'''
     try:
-        base = os.path.join(os.path.dirname(__name__), '..', 'data', 'model')
+        base = os.path.join(os.path.dirname(__file__), '..', 'data', 'model')
         return {
             'train': pl.read_parquet(os.path.join(base, 'train.parquet')),             
             'calibration': pl.read_parquet(os.path.join(base, 'calibration.parquet')),
@@ -71,7 +76,7 @@ def load_splits():
     
 
 def get_feature_cols(df: pl.DataFrame) -> list:
-    return [c for c in df.column if c not in EXCLUDE_COLS]
+    return [c for c in df.columns if c not in EXCLUDE_COLS]
 
 
 # Sidebar
@@ -295,11 +300,6 @@ with tab2:
             )
         else:
             try:
-                from api import (
-                    get_market_by_slug, get_recent_trades,
-                    MarketNotFoundError, MarketAlreadyResolvedError,
-                    InsufficientTradesError, APIError
-                )
                 from features import FeatureEngineer
 
                 with st.spinner('Fetching live market data...'):
