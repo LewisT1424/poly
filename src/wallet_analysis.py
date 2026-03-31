@@ -29,7 +29,7 @@ import time
 import logging
 
 # Config
-QUANT_PATH = Path('data/processed/quant_filtered.parquet')
+QUANT_PATH = Path('data/raw/quant.parquet')
 MARKETS_PATH = Path('data/processed/markets_political.parquet')
 OUTPUT_PATH = Path('data/processed/wallet_scores.parquet')
 
